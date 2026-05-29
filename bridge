@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LABEL="com.codex.feishu-codex-bridge"
+RUNTIME_DIR="${FEISHU_CODEX_RUNTIME_DIR:-${HOME}/Library/Application Support/FeishuCodexBridge}"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+
+case "${1:-help}" in
+  install)
+    exec "$(dirname "$0")/install.sh"
+    ;;
+  uninstall)
+    exec "$(dirname "$0")/uninstall.sh"
+    ;;
+  start)
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/${LABEL}"
+    ;;
+  stop)
+    launchctl bootout "gui/$(id -u)/${LABEL}" >/dev/null 2>&1 || true
+    ;;
+  restart)
+    launchctl kickstart -k "gui/$(id -u)/${LABEL}"
+    ;;
+  status)
+    launchctl print "gui/$(id -u)/${LABEL}"
+    ;;
+  logs)
+    tail -n "${2:-100}" "${RUNTIME_DIR}/feishu_codex_bridge.log"
+    ;;
+  follow-logs)
+    tail -f "${RUNTIME_DIR}/feishu_codex_bridge.log"
+    ;;
+  doctor)
+    echo "Python: $(command -v python3 || true)"
+    echo "Node: $(command -v node || true)"
+    echo "Codex: $(command -v codex || true)"
+    echo "Runtime: ${RUNTIME_DIR}"
+    echo "LaunchAgent: ${PLIST_PATH}"
+    ;;
+  help|*)
+    cat <<'HELP'
+Usage: ./bridge <command>
+
+Commands:
+  install       Install and start the macOS launchd service
+  uninstall     Stop and remove the macOS launchd service
+  start         Start the service
+  stop          Stop the service
+  restart       Restart the service
+  status        Print launchd status
+  logs [n]      Print the last n log lines
+  follow-logs   Follow the service log
+  doctor        Print local dependency paths
+HELP
+    ;;
+esac
