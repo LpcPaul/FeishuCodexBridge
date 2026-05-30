@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-05-30
+
+- Enabled CardKit 2.0 by default for Codex-generated JSON 2.0 cards.
+- Added CardKit 2.0 guidance for form cards, including `form` containers and `multi_select_static` multi-select fields.
+- Added automatic conversion from legacy `checkbox_group` test cards to CardKit 2.0 form cards.
+- Added submit-button callback stamping for CardKit form submissions.
+- Documented `checkbox_group` card send failures and the required CardKit permission.
+
 ## 0.2.0 - 2026-05-30
 
 - Added Codex-declared Feishu card blocks and button callback routing back into the same Codex session.

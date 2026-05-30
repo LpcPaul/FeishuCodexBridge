@@ -21,6 +21,7 @@ from feishu_codex_bridge import (
     extract_feishu_cards,
     parse_last_agent_message,
     parse_thread_id,
+    prepare_feishu_card_for_delivery,
     route_message,
     stamp_codex_card_callbacks,
 )
@@ -594,6 +595,101 @@ class FeishuCodexBridgeTests(unittest.TestCase):
         self.assertEqual(value["session_key"], "feishu:p2p:c1")
         self.assertEqual(value["origin_message_id"], "m1")
         self.assertEqual(value["choice"], "a")
+
+    def test_stamp_codex_card_callbacks_adds_form_submit_callback(self):
+        route = route_message(MessageEnvelope("m1", "c1", "p2p", "text", "选一个", "", "", "", None, True))
+        card = {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "form",
+                        "name": "form_1",
+                        "elements": [
+                            {
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "提交"},
+                                "form_action_type": "submit",
+                                "name": "submit_button",
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+        stamped = stamp_codex_card_callbacks(card, route, "m1")
+        button = stamped["body"]["elements"][0]["elements"][0]
+        callback = button["behaviors"][0]
+
+        self.assertEqual(callback["type"], "callback")
+        self.assertEqual(callback["value"]["bridge_action"], "codex_card")
+        self.assertEqual(callback["value"]["session_key"], "feishu:p2p:c1")
+        self.assertEqual(callback["value"]["origin_message_id"], "m1")
+
+    def test_prepare_feishu_card_converts_checkbox_group_to_cardkit_form(self):
+        route = route_message(MessageEnvelope("m1", "c1", "p2p", "text", "多选", "", "", "", None, True))
+        legacy_card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "blue",
+                "title": {"tag": "plain_text", "content": "明天去哪儿玩？"},
+            },
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "请选择一个或多个想去的地方。"}},
+                {
+                    "tag": "checkbox_group",
+                    "name": "places",
+                    "options": [
+                        {"text": {"tag": "plain_text", "content": "公园散步"}, "value": "park"},
+                        {"text": {"tag": "plain_text", "content": "看电影"}, "value": "movie"},
+                    ],
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "提交"},
+                            "type": "primary",
+                            "value": {"action": "submit_places"},
+                        }
+                    ],
+                },
+            ],
+        }
+
+        card = prepare_feishu_card_for_delivery(legacy_card, route, "m1")
+        form = card["body"]["elements"][1]
+        select = form["elements"][0]
+        button = form["elements"][1]["columns"][0]["elements"][0]
+        callback = button["behaviors"][0]["value"]
+
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(select["tag"], "multi_select_static")
+        self.assertEqual(select["name"], "places")
+        self.assertEqual(select["options"][0]["value"], "park")
+        self.assertEqual(button["form_action_type"], "submit")
+        self.assertEqual(callback["action"], "submit_places")
+        self.assertEqual(callback["bridge_action"], "codex_card")
+        self.assertEqual(callback["session_key"], "feishu:p2p:c1")
+
+    def test_interactive_content_uses_cardkit_for_schema_v2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("app", "secret", runtime_dir=Path(tmp), cardkit_enabled=True)
+            bridge = FeishuCodexBridge(config, None, None, None)
+
+            class FakeOpenAPI:
+                def create_card_id(self, card):
+                    self.card = card
+                    return "card_123"
+
+            fake_open_api = FakeOpenAPI()
+            bridge.open_api = fake_open_api
+            content = bridge._interactive_content({"schema": "2.0", "body": {"elements": []}})
+
+        self.assertEqual(json.loads(content), {"type": "card", "data": {"card_id": "card_123"}})
+        self.assertEqual(fake_open_api.card["schema"], "2.0")
 
     def test_codex_reply_sends_card_block_and_strips_json(self):
         events = []

@@ -30,7 +30,7 @@ from typing import Any
 
 DEFAULT_RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "FeishuCodexBridge"
 DEFAULT_WORKDIR = Path.home()
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_TOPIC_IDLE_SECONDS = 2 * 60 * 60
 DEFAULT_TASK_PROGRESS_SECONDS = 2 * 60 * 60
 DEFAULT_TOPIC_NOTICE_POLL_SECONDS = 60
@@ -44,8 +44,10 @@ MOBILE_REPLY_CONTEXT = (
 CARD_REPLY_CONTEXT = (
     "如果需要给用户发送飞书交互卡片，请在最终回复中放一个 ```feishu-card 代码块，内容是飞书卡片 JSON。\n"
     "Bridge 会发送卡片，并从普通文本回复里移除这段 JSON。\n"
-    "如果卡片按钮需要继续回调到当前 Codex 会话，请给按钮 value 放业务字段；Bridge 会自动补充回调标记。\n"
-    "用户点击后，你会收到形如 [card-click] {...} 的后续消息。"
+    "优先生成飞书 CardKit JSON 2.0：根字段使用 schema=\"2.0\"、header、body.elements。\n"
+    "需要表单、多选或提交时，必须使用 body.elements 里的 form 容器；多选使用 multi_select_static，不能使用 checkbox_group。\n"
+    "提交按钮放在 form 内，设置 form_action_type=\"submit\" 和 name，并用 behaviors 的 callback.value 放业务字段。\n"
+    "Bridge 会自动补充回调标记；用户点击提交后，你会收到形如 [card-click] {...} 的后续消息。"
 )
 DOC_REPLY_CONTEXT = (
     "如果复杂内容更适合用飞书文档承载，请在最终回复中放 <feishu_doc title=\"标题\">正文</feishu_doc>。\n"
@@ -75,7 +77,7 @@ class BridgeConfig:
     group_auto_reply_chat_ids: tuple[str, ...] = ()
     group_member_cache_seconds: float = DEFAULT_GROUP_MEMBER_CACHE_SECONDS
     codex_cards_enabled: bool = True
-    cardkit_enabled: bool = False
+    cardkit_enabled: bool = True
     docs_enabled: bool = False
     docs_folder_token: str = ""
     docs_domain: str = "https://feishu.cn"
@@ -107,7 +109,7 @@ class BridgeConfig:
                 DEFAULT_GROUP_MEMBER_CACHE_SECONDS,
             ),
             codex_cards_enabled=_bool_env("FEISHU_CODEX_CARDS_ENABLED", True),
-            cardkit_enabled=_bool_env("FEISHU_CARDKIT_ENABLED", False),
+            cardkit_enabled=_bool_env("FEISHU_CARDKIT_ENABLED", True),
             docs_enabled=_bool_env("FEISHU_DOCS_ENABLED", False),
             docs_folder_token=os.getenv("FEISHU_DOCS_FOLDER_TOKEN", "").strip(),
             docs_domain=os.getenv("FEISHU_DOCS_DOMAIN", "https://feishu.cn").strip() or "https://feishu.cn",
@@ -1094,6 +1096,161 @@ def extract_feishu_docs(text: str) -> tuple[str, list[FeishuDocRequest], list[st
     return cleaned.strip(), docs, errors
 
 
+def prepare_feishu_card_for_delivery(card: dict[str, Any], route: RouteDecision, origin_message_id: str) -> dict[str, Any]:
+    normalized = normalize_feishu_card(card)
+    return stamp_codex_card_callbacks(normalized, route, origin_message_id)
+
+
+def normalize_feishu_card(card: dict[str, Any]) -> dict[str, Any]:
+    if card.get("schema") == "2.0":
+        return card
+    converted = convert_checkbox_group_card(card)
+    return converted if converted else card
+
+
+def convert_checkbox_group_card(card: dict[str, Any]) -> dict[str, Any] | None:
+    elements = card.get("elements")
+    if not isinstance(elements, list):
+        return None
+
+    checkbox = next((item for item in elements if isinstance(item, dict) and item.get("tag") == "checkbox_group"), None)
+    if not checkbox:
+        return None
+
+    field_name = _safe_card_id(str(checkbox.get("name") or "multi_select"), "multi_select")
+    options = checkbox.get("options")
+    if not isinstance(options, list):
+        options = []
+
+    submit_button = _find_card_button(elements)
+    submit_text = _plain_text_content(submit_button.get("text") if submit_button else None, "提交")
+    submit_value = submit_button.get("value") if submit_button else {}
+    if not isinstance(submit_value, dict):
+        submit_value = {}
+
+    header = card.get("header") if isinstance(card.get("header"), dict) else {}
+    title = _plain_text_content(header.get("title") if isinstance(header, dict) else None, "请选择")
+    template = str(header.get("template") or "blue") if isinstance(header, dict) else "blue"
+    intro = _first_div_text(elements)
+
+    body_elements: list[dict[str, Any]] = []
+    if intro:
+        body_elements.append(
+            {
+                "tag": "markdown",
+                "content": intro,
+                "text_align": "left",
+                "text_size": "normal",
+            }
+        )
+    body_elements.append(
+        {
+            "tag": "form",
+            "name": "codex_form",
+            "elements": [
+                {
+                    "tag": "multi_select_static",
+                    "name": field_name,
+                    "type": "default",
+                    "width": "fill",
+                    "required": bool(checkbox.get("required", True)),
+                    "placeholder": {
+                        "tag": "plain_text",
+                        "content": _plain_text_content(checkbox.get("placeholder"), "请选择一个或多个选项"),
+                    },
+                    "selected_values": checkbox.get("selected_values") if isinstance(checkbox.get("selected_values"), list) else [],
+                    "options": [
+                        {
+                            "text": option.get("text") if isinstance(option.get("text"), dict) else {
+                                "tag": "plain_text",
+                                "content": str(option.get("text") or option.get("value") or "选项"),
+                            },
+                            "value": str(option.get("value") or ""),
+                        }
+                        for option in options
+                        if isinstance(option, dict) and str(option.get("value") or "")
+                    ],
+                },
+                {
+                    "tag": "column_set",
+                    "horizontal_align": "right",
+                    "columns": [
+                        {
+                            "tag": "column",
+                            "width": "auto",
+                            "elements": [
+                                {
+                                    "tag": "button",
+                                    "text": {"tag": "plain_text", "content": submit_text},
+                                    "type": "primary_filled",
+                                    "form_action_type": "submit",
+                                    "name": "submit_button",
+                                    "behaviors": [{"type": "callback", "value": dict(submit_value)}],
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    return {
+        "schema": "2.0",
+        "config": {
+            "update_multi": True,
+            "width_mode": "fill",
+            "summary": {"content": title},
+        },
+        "header": {
+            "template": template,
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {"elements": body_elements},
+    }
+
+
+def _find_card_button(elements: list[Any]) -> dict[str, Any] | None:
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        if element.get("tag") == "button":
+            return element
+        actions = element.get("actions")
+        if isinstance(actions, list):
+            for action in actions:
+                if isinstance(action, dict) and action.get("tag") == "button":
+                    return action
+    return None
+
+
+def _first_div_text(elements: list[Any]) -> str:
+    for element in elements:
+        if not isinstance(element, dict) or element.get("tag") != "div":
+            continue
+        content = _plain_text_content(element.get("text"), "")
+        if content:
+            return content
+    return ""
+
+
+def _plain_text_content(value: Any, default: str) -> str:
+    if isinstance(value, dict):
+        content = value.get("content")
+        if content is not None:
+            return str(content)
+    if isinstance(value, str):
+        return value
+    return default
+
+
+def _safe_card_id(value: str, default: str) -> str:
+    safe = re.sub(r"\W+", "_", value).strip("_")
+    if not safe or not re.match(r"^[A-Za-z]", safe):
+        safe = default
+    return safe[:20]
+
+
 def stamp_codex_card_callbacks(card: dict[str, Any], route: RouteDecision, origin_message_id: str) -> dict[str, Any]:
     def stamp_value(value: Any) -> Any:
         if not isinstance(value, dict):
@@ -1115,6 +1272,13 @@ def stamp_codex_card_callbacks(card: dict[str, Any], route: RouteDecision, origi
         result = {key: walk(value) for key, value in node.items()}
         if "value" in result and isinstance(result.get("value"), dict):
             result["value"] = stamp_value(result["value"])
+        if result.get("tag") == "button" and result.get("form_action_type") == "submit":
+            behaviors = result.get("behaviors")
+            if not isinstance(behaviors, list):
+                behaviors = []
+            if not any(isinstance(behavior, dict) and behavior.get("type") == "callback" for behavior in behaviors):
+                behaviors = [*behaviors, {"type": "callback", "value": {}}]
+            result["behaviors"] = behaviors
         behaviors = result.get("behaviors")
         if isinstance(behaviors, list):
             for behavior in behaviors:
@@ -1504,7 +1668,7 @@ class FeishuCodexBridge:
             delivered_parts.append("Codex 没有返回内容。")
 
         for card in cards:
-            stamped = stamp_codex_card_callbacks(card, route, envelope.message_id)
+            stamped = prepare_feishu_card_for_delivery(card, route, envelope.message_id)
             if self._reply_interactive(envelope.message_id, stamped):
                 delivered_parts.append("[已发送飞书卡片]")
             else:

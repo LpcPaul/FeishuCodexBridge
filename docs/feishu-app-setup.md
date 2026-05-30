@@ -58,14 +58,14 @@ FeishuCodexBridge 使用飞书开放平台的长连接 WebSocket 接收消息事
 | `im:message.group_at_msg:readonly` | 接收群聊里 @ 机器人的消息 |
 | `im:message:send_as_bot` | 让机器人回复消息 |
 
-如果你希望 Codex 能发带按钮的飞书卡片，并让点击继续回到 Codex 会话，需要确保卡片回调事件已经订阅。
+如果你希望 Codex 能发带按钮或表单提交的飞书卡片，并让点击继续回到 Codex 会话，需要确保卡片回调事件已经订阅。Bridge 默认使用 CardKit 2.0 发送 JSON 2.0 表单卡片，所以也需要 CardKit 写权限。
 
 建议一开始同时申请：
 
 | 权限或事件 | 用途 |
 | --- | --- |
 | `card.action.trigger` | 接收交互卡片按钮点击 |
-| `cardkit:card:write` | 以后启用 CardKit 2.0 卡片创建和更新 |
+| `cardkit:card:write` | 创建和发送 CardKit 2.0 卡片实体 |
 | `docx:document` 或 `docx:document:create` | 以后启用飞书文档创建/编辑 |
 | `im:chat:create` | 以后支持一条命令创建群组 |
 | `im:chat` | 配合建群后的群组信息获取和更新 |
