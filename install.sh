@@ -185,3 +185,19 @@ echo "FeishuCodexBridge installed."
 echo "Service: ${LABEL}"
 echo "Runtime: ${RUNTIME_DIR}"
 echo "Logs: ${RUNTIME_DIR}/feishu_codex_bridge.log"
+cat <<'NEXT'
+
+Next required Feishu app checks:
+  1. In Feishu Developer Console, open Development Config > Events and Callbacks.
+  2. Use long connection for events/callbacks.
+  3. Add im.message.receive_v1 under subscribed events.
+  4. Add card.action.trigger under subscribed callbacks.
+  5. Publish a new app version after saving.
+
+Then verify locally:
+  ./bridge status
+  ./bridge logs 30
+
+Full checklist: docs/post-install.md
+If card buttons show code 200340, card.action.trigger is not reaching this Bridge yet.
+NEXT
