@@ -28,7 +28,9 @@
 }
 ```
 
-如果后台不接受 JSON 导入，就把 `tenant` 里的 scope 逐个复制到权限搜索框里搜索并申请；`events` 里的两项到「事件与回调」里订阅。
+如果后台不接受 JSON 导入，就把 `tenant` 里的 scope 逐个复制到权限搜索框里搜索并申请；`events` 里的 `im.message.receive_v1` 到「已订阅的事件」里订阅，`card.action.trigger` 到「已订阅的回调」里订阅。
+
+卡片按钮只申请权限还不够。应用还必须在「事件与回调」里配置回调订阅方式。FeishuCodexBridge 使用长连接接收卡片回调，所以不需要公网 URL，但需要把 `card.action.trigger` 添加到已订阅回调并发布新版应用。否则点击按钮会在客户端报 `code: 200340`。
 
 ## 每个权限解决什么
 
