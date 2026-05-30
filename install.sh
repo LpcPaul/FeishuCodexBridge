@@ -55,6 +55,22 @@ prompt_value() {
   printf '%s' "$current"
 }
 
+cat <<'NOTICE'
+Before installing, make sure the Feishu app has these initial permissions/events:
+  im:message.p2p_msg:readonly
+  im:message.group_at_msg:readonly
+  im:message:send_as_bot
+  im.message.receive_v1
+Recommended if you want cards, docs, or group creation later:
+  card.action.trigger
+  cardkit:card:write
+  docx:document or docx:document:create
+  im:chat:create
+  im:chat
+See docs/initial-permissions.md for the import JSON.
+
+NOTICE
+
 FEISHU_APP_ID="$(prompt_value "Feishu App ID" "${FEISHU_APP_ID:-}")"
 FEISHU_APP_SECRET="$(prompt_secret "Feishu App Secret" "${FEISHU_APP_SECRET:-}")"
 
@@ -94,7 +110,7 @@ then
   "$PYTHON_BIN" -m pip install --user -r "$APP_DIR/requirements.txt"
 fi
 
-export FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_CODEX_WORKDIR RUNTIME_DIR NODE_BIN CODEX_BIN
+export FEISHU_APP_ID FEISHU_APP_SECRET FEISHU_CODEX_WORKDIR RUNTIME_DIR PYTHON_BIN NODE_BIN CODEX_BIN
 "$PYTHON_BIN" - "$ENV_FILE" <<'PY'
 import os
 import shlex
@@ -112,8 +128,20 @@ values = {
     "CODEX_BIN": os.environ["CODEX_BIN"],
     "FEISHU_TOPIC_IDLE_SECONDS": os.environ.get("FEISHU_TOPIC_IDLE_SECONDS", "7200"),
     "FEISHU_TOPIC_NOTICE_ENABLED": os.environ.get("FEISHU_TOPIC_NOTICE_ENABLED", "1"),
+    "FEISHU_TOPIC_NOTICE_POLL_SECONDS": os.environ.get("FEISHU_TOPIC_NOTICE_POLL_SECONDS", "60"),
     "FEISHU_TASK_PROGRESS_SECONDS": os.environ.get("FEISHU_TASK_PROGRESS_SECONDS", "7200"),
     "FEISHU_ACK_TEXT": os.environ.get("FEISHU_ACK_TEXT", "收到，我要开始干活了，稍等我"),
+    "FEISHU_GROUP_AUTO_REPLY_ENABLED": os.environ.get("FEISHU_GROUP_AUTO_REPLY_ENABLED", "1"),
+    "FEISHU_GROUP_AUTO_REPLY_MAX_HUMAN_MEMBERS": os.environ.get("FEISHU_GROUP_AUTO_REPLY_MAX_HUMAN_MEMBERS", "1"),
+    "FEISHU_GROUP_AUTO_REPLY_CHAT_IDS": os.environ.get("FEISHU_GROUP_AUTO_REPLY_CHAT_IDS", ""),
+    "FEISHU_GROUP_MEMBER_CACHE_SECONDS": os.environ.get("FEISHU_GROUP_MEMBER_CACHE_SECONDS", "600"),
+    "FEISHU_CODEX_CARDS_ENABLED": os.environ.get("FEISHU_CODEX_CARDS_ENABLED", "1"),
+    "FEISHU_CARDKIT_ENABLED": os.environ.get("FEISHU_CARDKIT_ENABLED", "0"),
+    "FEISHU_DOCS_ENABLED": os.environ.get("FEISHU_DOCS_ENABLED", "0"),
+    "FEISHU_DOCS_FOLDER_TOKEN": os.environ.get("FEISHU_DOCS_FOLDER_TOKEN", ""),
+    "FEISHU_DOCS_DOMAIN": os.environ.get("FEISHU_DOCS_DOMAIN", "https://feishu.cn"),
+    "FEISHU_DOCS_AUTO_MIN_CHARS": os.environ.get("FEISHU_DOCS_AUTO_MIN_CHARS", "4500"),
+    "FEISHU_DOCS_BLOCK_CHARS": os.environ.get("FEISHU_DOCS_BLOCK_CHARS", "1500"),
 }
 env_path.write_text(
     "\n".join(f"{key}={shlex.quote(value)}" for key, value in values.items()) + "\n",

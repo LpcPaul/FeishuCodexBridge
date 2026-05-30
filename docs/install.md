@@ -43,6 +43,17 @@ cd FeishuCodexBridge
 ~/Library/Application Support/FeishuCodexBridge/app/.env.feishu
 ```
 
+可选能力也在这个文件里开启：
+
+```bash
+FEISHU_CODEX_CARDS_ENABLED=1
+FEISHU_CARDKIT_ENABLED=0
+FEISHU_DOCS_ENABLED=0
+FEISHU_DOCS_FOLDER_TOKEN=
+```
+
+修改配置后运行 `./bridge restart` 让服务重新读取。
+
 LaunchAgent：
 
 ```text

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 - 2026-05-30
+
+- Added Codex-declared Feishu card blocks and button callback routing back into the same Codex session.
+- Added optional CardKit 2.0 send-by-card-id support.
+- Added optional Feishu Docx document creation from Codex-declared document blocks and long replies.
+- Added `/docs` status command and documentation for the extra card/doc permissions.
+- Added initial Feishu permission JSON covering message, card, document, and group creation scopes.
+
 ## 0.1.0 - 2026-05-29
 
 Initial public release.
