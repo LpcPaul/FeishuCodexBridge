@@ -888,6 +888,54 @@ class FeishuCodexBridgeTests(unittest.TestCase):
         self.assertIn(("send", "c1", "已收到你的提交，正在继续处理。"), events)
         self.assertIn(("send", "c1", "已处理提交"), events)
 
+    def test_codex_card_action_returns_before_slow_ack_delivery(self):
+        events = []
+        final_replied = threading.Event()
+
+        class FakeRunner:
+            def run(self, prompt, thread_id):
+                events.append(("run", thread_id, prompt))
+                return "thread-existing", "已处理慢回执"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("app", "secret", runtime_dir=Path(tmp), task_progress_seconds=0)
+            bridge = FeishuCodexBridge(config, None, None, None)
+            bridge.runner = FakeRunner()
+            bridge.store.upsert_session("feishu:p2p:c1", "direct-chat")
+            bridge.store.set_thread_id("feishu:p2p:c1", "thread-existing")
+
+            def slow_reply(message_id, text):
+                events.append(("reply", message_id, text))
+                time.sleep(0.2)
+                if text == "已处理慢回执":
+                    final_replied.set()
+
+            bridge._reply_text = slow_reply
+            data = SimpleNamespace(
+                event=SimpleNamespace(
+                    chat_id="c1",
+                    action=SimpleNamespace(
+                        value={
+                            "bridge_action": "codex_card",
+                            "session_key": "feishu:p2p:c1",
+                            "origin_message_id": "m-original",
+                            "payload": {"choice": "ok"},
+                        }
+                    ),
+                    operator=SimpleNamespace(open_id="ou_1", name="User"),
+                )
+            )
+
+            started_at = time.monotonic()
+            bridge.handle_card_action(data)
+            elapsed = time.monotonic() - started_at
+
+            self.assertLess(elapsed, 0.1)
+            self.assertTrue(final_replied.wait(1))
+
+        self.assertIn(("reply", "m-original", "已收到你的提交，正在继续处理。"), events)
+        self.assertIn(("reply", "m-original", "已处理慢回执"), events)
+
     def test_codex_card_action_ack_mode_skips_codex(self):
         events = []
 

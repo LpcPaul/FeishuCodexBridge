@@ -136,7 +136,7 @@ FEISHU_DOCS_AUTO_MIN_CHARS=4500
 
 需要多选、表单和提交反馈时，Codex 应使用 JSON 2.0 的 `form` 容器和 `multi_select_static` 组件。Bridge 会把旧式 `checkbox_group` 测试卡片自动转换成 CardKit 2.0 表单，避免飞书接口返回 `unsupported type of block`。
 
-卡片提交后，Bridge 会在聊天里额外发一条可见回执。默认模式会继续把提交内容交给 Codex 处理，并在完成后返回结果；如果某张卡片只需要确认收到，回调 `value` 可以设置 `requires_codex:false` 或 `feedback_mode:"ack"`，Bridge 就只发默认回执，不启动 Codex。
+卡片提交后，Bridge 会立即向飞书返回卡片回调响应，并在后台给聊天发一条可见回执。默认模式会继续把提交内容交给 Codex 处理，并在完成后返回结果；如果某张卡片只需要确认收到，回调 `value` 可以设置 `requires_codex:false` 或 `feedback_mode:"ack"`，Bridge 就只发默认回执，不启动 Codex。
 
 飞书文档能力默认关闭。开启前需要先在飞书开放平台给应用申请新版文档创建/编辑权限，然后配置：
 
@@ -160,6 +160,6 @@ FEISHU_DOCS_FOLDER_TOKEN=可选的目标文件夹 token
 
 ## 版本
 
-当前版本：`0.4.0`
+当前版本：`0.4.1`
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)。

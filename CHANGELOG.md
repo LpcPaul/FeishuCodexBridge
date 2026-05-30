@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 - 2026-05-30
+
+- Made Codex card callbacks return immediately while acknowledgement and Codex processing continue in the background.
+- Prefer chat messages for card-action text delivery so proactive cards produce clearly visible follow-up replies.
+
 ## 0.4.0 - 2026-05-30
 
 - Added visible chat acknowledgements for Codex card submissions.

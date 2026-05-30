@@ -30,7 +30,7 @@ from typing import Any
 
 DEFAULT_RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "FeishuCodexBridge"
 DEFAULT_WORKDIR = Path.home()
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DEFAULT_TOPIC_IDLE_SECONDS = 2 * 60 * 60
 DEFAULT_TASK_PROGRESS_SECONDS = 2 * 60 * 60
 DEFAULT_TOPIC_NOTICE_POLL_SECONDS = 60
@@ -1791,6 +1791,12 @@ class FeishuCodexBridge:
         return False
 
     def _deliver_text(self, envelope: MessageEnvelope, text: str) -> bool:
+        if envelope.message_type == "card_action" and envelope.chat_id:
+            try:
+                if self._send_text_message(envelope.chat_id, text):
+                    return True
+            except Exception as exc:
+                print(f"Feishu proactive text send failed for {envelope.chat_id}: {exc}", flush=True)
         if envelope.message_id:
             try:
                 result = self._reply_text(envelope.message_id, text)
@@ -1923,15 +1929,23 @@ class FeishuCodexBridge:
         )
         self.store.upsert_session(session_key, "card-action", "card action")
         if not card_action_requires_codex(action):
-            self._deliver_text(envelope, CARD_ACK_TEXT)
+            worker = threading.Thread(
+                target=self._deliver_text,
+                args=(envelope, CARD_ACK_TEXT),
+                daemon=True,
+            )
+            worker.start()
             return topic_action_response(CARD_ACK_TEXT)
-        self._deliver_text(envelope, CARD_PROCESSING_TEXT)
         thread_id = self.store.get_thread_id(session_key)
         prompt = build_card_action_prompt(envelope, route, payload, self.config)
         self.store.begin_task(session_key)
+
+        def run_card_action() -> None:
+            self._deliver_text(envelope, CARD_PROCESSING_TEXT)
+            self._run_codex_and_reply(envelope, route, thread_id, prompt)
+
         worker = threading.Thread(
-            target=self._run_codex_and_reply,
-            args=(envelope, route, thread_id, prompt),
+            target=run_card_action,
             daemon=True,
         )
         try:
