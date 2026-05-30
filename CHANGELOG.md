@@ -7,6 +7,8 @@
 - Added optional Feishu Docx document creation from Codex-declared document blocks and long replies.
 - Added `/docs` status command and documentation for the extra card/doc permissions.
 - Added initial Feishu permission JSON covering message, card, document, and group creation scopes.
+- Added post-install Feishu callback checklist to prevent card button `code: 200340` setup issues.
+- Fixed launchd startup by using the `certifi` CA bundle for Feishu WebSocket TLS verification.
 
 ## 0.1.0 - 2026-05-29
 
