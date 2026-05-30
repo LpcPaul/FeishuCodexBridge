@@ -791,7 +791,142 @@ class FeishuCodexBridgeTests(unittest.TestCase):
         run_event = next(event for event in events if event[0] == "run")
         self.assertEqual(run_event[1], "thread-existing")
         self.assertIn('[card-click] {"choice": "ok"}', run_event[2])
+        self.assertIn(("reply", "m-original", "已收到你的提交，正在继续处理。"), events)
         self.assertIn(("reply", "m-original", "已处理点击"), events)
+
+    def test_codex_card_action_prefers_callback_message_id_when_origin_is_synthetic(self):
+        events = []
+        final_replied = threading.Event()
+
+        class FakeRunner:
+            def run(self, prompt, thread_id):
+                events.append(("run", thread_id, prompt))
+                return "thread-existing", "已处理选择"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("app", "secret", runtime_dir=Path(tmp), task_progress_seconds=0)
+            bridge = FeishuCodexBridge(config, None, None, None)
+            bridge.runner = FakeRunner()
+            bridge.store.upsert_session("feishu:p2p:c1", "direct-chat")
+            bridge.store.set_thread_id("feishu:p2p:c1", "thread-existing")
+
+            def fake_reply(message_id, text):
+                events.append(("reply", message_id, text))
+                if text == "已处理选择":
+                    final_replied.set()
+
+            bridge._reply_text = fake_reply
+            data = SimpleNamespace(
+                event=SimpleNamespace(
+                    chat_id="c1",
+                    context=SimpleNamespace(open_message_id="om_card_message"),
+                    action=SimpleNamespace(
+                        value={
+                            "bridge_action": "codex_card",
+                            "session_key": "feishu:p2p:c1",
+                            "origin_message_id": "manual-cardkit-verify",
+                            "payload": {"places": ["park"]},
+                        }
+                    ),
+                    operator=SimpleNamespace(open_id="ou_1", name="User"),
+                )
+            )
+
+            bridge.handle_card_action(data)
+            self.assertTrue(final_replied.wait(1))
+            time.sleep(0.05)
+
+        self.assertIn(("reply", "om_card_message", "已收到你的提交，正在继续处理。"), events)
+        self.assertIn(("reply", "om_card_message", "已处理选择"), events)
+
+    def test_codex_card_action_falls_back_to_chat_send_when_reply_fails(self):
+        events = []
+        final_sent = threading.Event()
+
+        class FakeRunner:
+            def run(self, prompt, thread_id):
+                return "thread-existing", "已处理提交"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("app", "secret", runtime_dir=Path(tmp), task_progress_seconds=0)
+            bridge = FeishuCodexBridge(config, None, None, None)
+            bridge.runner = FakeRunner()
+            bridge.store.upsert_session("feishu:p2p:c1", "direct-chat")
+            bridge.store.set_thread_id("feishu:p2p:c1", "thread-existing")
+
+            def fake_reply(message_id, text):
+                events.append(("reply-failed", message_id, text))
+                return False
+
+            def fake_send(chat_id, text):
+                events.append(("send", chat_id, text))
+                if text == "已处理提交":
+                    final_sent.set()
+                return True
+
+            bridge._reply_text = fake_reply
+            bridge._send_text_message = fake_send
+            data = SimpleNamespace(
+                event=SimpleNamespace(
+                    chat_id="c1",
+                    action=SimpleNamespace(
+                        value={
+                            "bridge_action": "codex_card",
+                            "session_key": "feishu:p2p:c1",
+                            "origin_message_id": "manual-cardkit-verify",
+                            "payload": {"choice": "ok"},
+                        }
+                    ),
+                    operator=SimpleNamespace(open_id="ou_1", name="User"),
+                )
+            )
+
+            bridge.handle_card_action(data)
+            self.assertTrue(final_sent.wait(1))
+            time.sleep(0.05)
+
+        self.assertIn(("send", "c1", "已收到你的提交，正在继续处理。"), events)
+        self.assertIn(("send", "c1", "已处理提交"), events)
+
+    def test_codex_card_action_ack_mode_skips_codex(self):
+        events = []
+
+        class FakeRunner:
+            def run(self, prompt, thread_id):
+                events.append(("run", thread_id, prompt))
+                return "thread-existing", "不应执行"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("app", "secret", runtime_dir=Path(tmp), task_progress_seconds=0)
+            bridge = FeishuCodexBridge(config, None, None, None)
+            bridge.runner = FakeRunner()
+            bridge.store.upsert_session("feishu:p2p:c1", "direct-chat")
+
+            def fake_reply(message_id, text):
+                events.append(("reply", message_id, text))
+
+            bridge._reply_text = fake_reply
+            data = SimpleNamespace(
+                event=SimpleNamespace(
+                    chat_id="c1",
+                    action=SimpleNamespace(
+                        value={
+                            "bridge_action": "codex_card",
+                            "session_key": "feishu:p2p:c1",
+                            "origin_message_id": "m-original",
+                            "requires_codex": False,
+                            "payload": {"choice": "ok"},
+                        }
+                    ),
+                    operator=SimpleNamespace(open_id="ou_1", name="User"),
+                )
+            )
+
+            bridge.handle_card_action(data)
+            time.sleep(0.05)
+
+        self.assertIn(("reply", "m-original", "已收到你的提交。"), events)
+        self.assertFalse(any(event[0] == "run" for event in events))
 
     def test_codex_reply_creates_feishu_doc_block(self):
         events = []

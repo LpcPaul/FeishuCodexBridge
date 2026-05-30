@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 - 2026-05-30
+
+- Added visible chat acknowledgements for Codex card submissions.
+- Added `requires_codex=false` / `feedback_mode="ack"` for cards that only need a default receipt and should not resume Codex.
+- Added fallback delivery from message reply to chat send when a card action comes from a proactive card or synthetic origin message id.
+
 ## 0.3.0 - 2026-05-30
 
 - Enabled CardKit 2.0 by default for Codex-generated JSON 2.0 cards.

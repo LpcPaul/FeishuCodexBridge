@@ -64,6 +64,14 @@ Bridge 会自动把旧式 `checkbox_group` 测试卡片转换成 CardKit 2.0 表
 2. 飞书应用已申请并发布 `cardkit:card:write` 权限。
 3. 卡片 JSON 已声明 `"schema": "2.0"`，且表单提交按钮在 `form` 容器内。
 
+## 卡片提交后飞书提示已提交，但聊天里没有回复
+
+飞书客户端的“已提交”只代表卡片回调已经被客户端接受，不代表 Bridge 已经把处理结果发回聊天。
+
+Bridge 会在收到 Codex 卡片提交后额外发送一条聊天内回执。默认回执是“已收到你的提交，正在继续处理。”，随后继续把提交内容交给 Codex；如果卡片设置了 `requires_codex:false` 或 `feedback_mode:"ack"`，Bridge 只发送“已收到你的提交。”，不启动 Codex。
+
+如果日志里出现 `Invalid ids`，通常说明这张卡片不是作为某条真实飞书消息的回复发出，或者回调里带的是测试用临时消息编号。Bridge 会优先使用卡片回调里的真实消息编号，必要时改为按 `chat_id` 主动发消息。
+
 ## 日志里提示缺少 App ID 或 App Secret
 
 检查配置文件：

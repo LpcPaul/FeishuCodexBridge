@@ -30,12 +30,14 @@ from typing import Any
 
 DEFAULT_RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "FeishuCodexBridge"
 DEFAULT_WORKDIR = Path.home()
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DEFAULT_TOPIC_IDLE_SECONDS = 2 * 60 * 60
 DEFAULT_TASK_PROGRESS_SECONDS = 2 * 60 * 60
 DEFAULT_TOPIC_NOTICE_POLL_SECONDS = 60
 DEFAULT_GROUP_MEMBER_CACHE_SECONDS = 10 * 60
 DEFAULT_ACK_TEXT = "收到，我要开始干活了，稍等我"
+CARD_ACK_TEXT = "已收到你的提交。"
+CARD_PROCESSING_TEXT = "已收到你的提交，正在继续处理。"
 MOBILE_REPLY_CONTEXT = (
     "你正在通过手机通信软件回复用户。请使用移动端可读格式：\n"
     "先给结论/摘要/判断；短段落；根据消息类型组织内容；\n"
@@ -47,7 +49,9 @@ CARD_REPLY_CONTEXT = (
     "优先生成飞书 CardKit JSON 2.0：根字段使用 schema=\"2.0\"、header、body.elements。\n"
     "需要表单、多选或提交时，必须使用 body.elements 里的 form 容器；多选使用 multi_select_static，不能使用 checkbox_group。\n"
     "提交按钮放在 form 内，设置 form_action_type=\"submit\" 和 name，并用 behaviors 的 callback.value 放业务字段。\n"
-    "Bridge 会自动补充回调标记；用户点击提交后，你会收到形如 [card-click] {...} 的后续消息。"
+    "Bridge 会自动补充回调标记；用户点击提交后，你会收到形如 [card-click] {...} 的后续消息。\n"
+    "默认情况下卡片提交会继续交给 Codex 处理并回发结果；如果只需要确认收到，"
+    "请在 callback.value 中设置 requires_codex=false 或 feedback_mode=\"ack\"。"
 )
 DOC_REPLY_CONTEXT = (
     "如果复杂内容更适合用飞书文档承载，请在最终回复中放 <feishu_doc title=\"标题\">正文</feishu_doc>。\n"
@@ -1316,6 +1320,18 @@ def extract_card_action_message_id(data: Any) -> str:
     return ""
 
 
+def is_feishu_message_id(value: str) -> bool:
+    return bool(value and value.startswith("om_"))
+
+
+def select_card_action_reply_message_id(data: Any, action: dict[str, Any]) -> str:
+    origin_message_id = str(action.get("origin_message_id", "") or "")
+    callback_message_id = extract_card_action_message_id(data)
+    if is_feishu_message_id(origin_message_id):
+        return origin_message_id
+    return callback_message_id or origin_message_id
+
+
 def extract_card_action_chat(data: Any) -> tuple[str, str, str, str]:
     event = getattr(data, "event", None)
     context = getattr(event, "context", None)
@@ -1333,7 +1349,14 @@ def extract_card_action_chat(data: Any) -> tuple[str, str, str, str]:
 
 
 def card_action_payload(action: dict[str, Any], form_value: dict[str, Any] | None) -> dict[str, Any]:
-    payload = {key: value for key, value in action.items() if key not in {"bridge_action", "session_key", "origin_message_id"}}
+    control_keys = {
+        "bridge_action",
+        "session_key",
+        "origin_message_id",
+        "requires_codex",
+        "feedback_mode",
+    }
+    payload = {key: value for key, value in action.items() if key not in control_keys}
     if form_value:
         payload["form_value"] = form_value
     if set(payload.keys()) == {"payload"} and isinstance(payload["payload"], dict):
@@ -1341,6 +1364,16 @@ def card_action_payload(action: dict[str, Any], form_value: dict[str, Any] | Non
         if form_value:
             payload["form_value"] = form_value
     return payload
+
+
+def card_action_requires_codex(action: dict[str, Any]) -> bool:
+    requires = action.get("requires_codex")
+    if requires is False:
+        return False
+    if isinstance(requires, str) and requires.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    mode = str(action.get("feedback_mode") or "").strip().lower()
+    return mode not in {"ack", "ack_only", "default_reply", "no_process", "no-process", "noop", "none"}
 
 
 def chunk_text(text: str, size: int) -> list[str]:
@@ -1661,19 +1694,19 @@ class FeishuCodexBridge:
         delivered_parts: list[str] = []
         if text.strip():
             reply_text = truncate_reply(text, self.config.reply_max_chars)
-            self._reply_text(envelope.message_id, reply_text)
+            self._deliver_text(envelope, reply_text)
             delivered_parts.append(reply_text)
         elif not cards:
-            self._reply_text(envelope.message_id, "Codex 没有返回内容。")
+            self._deliver_text(envelope, "Codex 没有返回内容。")
             delivered_parts.append("Codex 没有返回内容。")
 
         for card in cards:
             stamped = prepare_feishu_card_for_delivery(card, route, envelope.message_id)
-            if self._reply_interactive(envelope.message_id, stamped):
+            if self._deliver_interactive(envelope, stamped):
                 delivered_parts.append("[已发送飞书卡片]")
             else:
                 failure = "飞书卡片发送失败，已保留在本机 Codex 会话。"
-                self._reply_text(envelope.message_id, failure)
+                self._deliver_text(envelope, failure)
                 delivered_parts.append(failure)
 
         return "\n\n".join(delivered_parts).strip()
@@ -1697,7 +1730,7 @@ class FeishuCodexBridge:
                     "完成后会继续在这里返回最终结果。"
                 )
                 try:
-                    self._reply_text(envelope.message_id, text)
+                    self._deliver_text(envelope, text)
                 except Exception as exc:
                     print(
                         f"Progress reply failed for {envelope.message_id} ({route.session_key}): {exc}",
@@ -1713,7 +1746,7 @@ class FeishuCodexBridge:
             return False
         return time.time() - (envelope.create_time_ms / 1000) > self.config.ignore_older_than_seconds
 
-    def _reply_text(self, message_id: str, text: str) -> None:
+    def _reply_text(self, message_id: str, text: str) -> bool:
         content = json.dumps({"text": text}, ensure_ascii=False)
         request = (
             self.reply_request.builder()
@@ -1724,8 +1757,57 @@ class FeishuCodexBridge:
         response = self.api_client.im.v1.message.reply(request)
         success = getattr(response, "success", None)
         if callable(success) and success():
-            return
+            return True
         print(f"Feishu reply failed: code={getattr(response, 'code', '')} msg={getattr(response, 'msg', '')}")
+        return False
+
+    def _send_text_message(self, chat_id: str, text: str) -> bool:
+        if not self.api_client:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        except Exception as exc:
+            print(f"Feishu create text message import failed: {exc}", flush=True)
+            return False
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(content)
+                .uuid(str(uuid.uuid4()))
+                .build()
+            )
+            .build()
+        )
+        response = self.api_client.im.v1.message.create(request)
+        success = getattr(response, "success", None)
+        if callable(success) and success():
+            return True
+        print(f"Feishu text send failed: code={getattr(response, 'code', '')} msg={getattr(response, 'msg', '')}")
+        return False
+
+    def _deliver_text(self, envelope: MessageEnvelope, text: str) -> bool:
+        if envelope.message_id:
+            try:
+                result = self._reply_text(envelope.message_id, text)
+                if result is not False:
+                    return True
+            except Exception as exc:
+                print(f"Feishu reply failed for {envelope.message_id}: {exc}", flush=True)
+        if envelope.chat_id:
+            return self._send_text_message(envelope.chat_id, text)
+        return False
+
+    def _deliver_interactive(self, envelope: MessageEnvelope, card: dict[str, Any]) -> bool:
+        if envelope.message_id and self._reply_interactive(envelope.message_id, card):
+            return True
+        if envelope.chat_id:
+            return self._send_interactive_message(envelope.chat_id, card)
+        return False
 
     def _reply_ack(self, message_id: str) -> None:
         if self.config.ack_text:
@@ -1819,10 +1901,10 @@ class FeishuCodexBridge:
         session_key = str(action.get("session_key", "") or "")
         if not session_key:
             return topic_action_response("缺少会话信息。", "error")
-        reply_to_message_id = str(action.get("origin_message_id", "") or "") or extract_card_action_message_id(data)
-        if not reply_to_message_id:
-            return topic_action_response("缺少原始消息，无法回发结果。", "error")
         chat_id, chat_type, sender_id, sender_name = extract_card_action_chat(data)
+        reply_to_message_id = select_card_action_reply_message_id(data, action)
+        if not reply_to_message_id and not chat_id:
+            return topic_action_response("缺少原始消息和会话信息，无法回发结果。", "error")
         payload = card_action_payload(action, extract_card_action_form_value(data))
         route = RouteDecision(session_key=session_key, should_handle=True, reason="card-action")
         envelope = MessageEnvelope(
@@ -1840,6 +1922,10 @@ class FeishuCodexBridge:
             sender_name=sender_name,
         )
         self.store.upsert_session(session_key, "card-action", "card action")
+        if not card_action_requires_codex(action):
+            self._deliver_text(envelope, CARD_ACK_TEXT)
+            return topic_action_response(CARD_ACK_TEXT)
+        self._deliver_text(envelope, CARD_PROCESSING_TEXT)
         thread_id = self.store.get_thread_id(session_key)
         prompt = build_card_action_prompt(envelope, route, payload, self.config)
         self.store.begin_task(session_key)
