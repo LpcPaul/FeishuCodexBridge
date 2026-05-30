@@ -44,4 +44,19 @@ export CODEX_BIN="${CODEX_BIN:-$(command -v codex || detect_nvm_file "${HOME}/.n
 export PYTHON_BIN="${PYTHON_BIN:-$(detect_nvm_file "/Library/Frameworks/Python.framework/Versions/*/bin/python3")}"
 export PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
 
+if [[ -z "${SSL_CERT_FILE:-}" || ! -f "${SSL_CERT_FILE:-}" ]]; then
+  CERTIFI_CAFILE="$("$PYTHON_BIN" - <<'PY' 2>/dev/null || true
+try:
+    import certifi
+except Exception:
+    raise SystemExit(0)
+print(certifi.where())
+PY
+)"
+  if [[ -n "$CERTIFI_CAFILE" && -f "$CERTIFI_CAFILE" ]]; then
+    export SSL_CERT_FILE="$CERTIFI_CAFILE"
+    export REQUESTS_CA_BUNDLE="${REQUESTS_CA_BUNDLE:-$CERTIFI_CAFILE}"
+  fi
+fi
+
 exec "$PYTHON_BIN" -u feishu_codex_bridge.py
