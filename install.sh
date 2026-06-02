@@ -126,6 +126,8 @@ values = {
     "PYTHON_BIN": os.environ["PYTHON_BIN"],
     "NODE_BIN": os.environ.get("NODE_BIN", ""),
     "CODEX_BIN": os.environ["CODEX_BIN"],
+    "FEISHU_CODEX_BACKEND": os.environ.get("FEISHU_CODEX_BACKEND", "exec"),
+    "FEISHU_CODEX_MODEL": os.environ.get("FEISHU_CODEX_MODEL", ""),
     "FEISHU_TOPIC_IDLE_SECONDS": os.environ.get("FEISHU_TOPIC_IDLE_SECONDS", "7200"),
     "FEISHU_TOPIC_NOTICE_ENABLED": os.environ.get("FEISHU_TOPIC_NOTICE_ENABLED", "1"),
     "FEISHU_TOPIC_NOTICE_POLL_SECONDS": os.environ.get("FEISHU_TOPIC_NOTICE_POLL_SECONDS", "60"),

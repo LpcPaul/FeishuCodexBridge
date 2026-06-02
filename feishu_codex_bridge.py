@@ -30,7 +30,8 @@ from typing import Any
 
 DEFAULT_RUNTIME_DIR = Path.home() / "Library" / "Application Support" / "FeishuCodexBridge"
 DEFAULT_WORKDIR = Path.home()
-VERSION = "0.4.1"
+VERSION = "0.5.0"
+DEFAULT_CODEX_BACKEND = "exec"
 DEFAULT_TOPIC_IDLE_SECONDS = 2 * 60 * 60
 DEFAULT_TASK_PROGRESS_SECONDS = 2 * 60 * 60
 DEFAULT_TOPIC_NOTICE_POLL_SECONDS = 60
@@ -53,6 +54,20 @@ CARD_REPLY_CONTEXT = (
     "默认情况下卡片提交会继续交给 Codex 处理并回发结果；如果只需要确认收到，"
     "请在 callback.value 中设置 requires_codex=false 或 feedback_mode=\"ack\"。"
 )
+READING_CONFIRMATION_CONTEXT = (
+    "当用户通过飞书给出一篇或多篇文章、链接或资料时，即使没有额外说明，也默认是让你读一下；"
+    "如果用户用非固定表达要求你读、看、总结、理解、拆解、提炼重点或帮他判断价值，"
+    "由你判断是否适合生成飞书阅读确认卡片；Bridge 不做这类意图识别。\n"
+    "飞书阅读确认卡片是网页阅读确认的飞书通道版本：先理解文章，再把值得用户确认、追问或排除的内容拆成若干确认项。\n"
+    "在飞书通道处理读文章任务时，默认用飞书卡片返回结果；最终回复里必须包含 ```feishu-card 代码块，"
+    "不要只发纯文本摘要，除非内容获取失败或用户明确不要卡片。\n"
+    "处理链接时优先使用知识库里的内容阅读/内容获取工具；微信公众号 mp.weixin.qq.com 链接先走本地微信正文解析，"
+    "如果微信返回访问验证页，就明确请用户复制正文或提供已保存文件，不要尝试用 Computer Use 操作该 URL。\n"
+    "确认项数量不要写死；根据文章长度、信息密度和可讨论价值决定，短文可以很少，长文可以更多，但每条都要有明确增量价值。\n"
+    "卡片顶部先放文章标题、来源和整体逻辑概览；卡片里每个确认项应提供必要上下文，并给出“知道了”“不感兴趣”“展开讲讲”等反馈入口；也可以用表单收集文本反馈。\n"
+    "每个按钮或表单提交的 callback.value 应包含可回溯字段，例如 reading_session_id、item_id、choice、article_url 或 article_index；"
+    "Bridge 会把点击内容以 [card-click] 形式送回同一个 Codex 会话，你再继续用文本回答或二次拆解。"
+)
 DOC_REPLY_CONTEXT = (
     "如果复杂内容更适合用飞书文档承载，请在最终回复中放 <feishu_doc title=\"标题\">正文</feishu_doc>。\n"
     "Bridge 会创建飞书文档、写入正文，并把文档链接发给用户。"
@@ -68,6 +83,8 @@ class BridgeConfig:
     runtime_dir: Path = DEFAULT_RUNTIME_DIR
     codex_bin: str = "codex"
     node_bin: str = ""
+    codex_backend: str = DEFAULT_CODEX_BACKEND
+    codex_model: str = ""
     bot_aliases: tuple[str, ...] = ("Codex", "codex", "机器人")
     ignore_older_than_seconds: int = 600
     reply_max_chars: int = 3500
@@ -90,13 +107,17 @@ class BridgeConfig:
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
+        runtime_dir = Path(os.getenv("FEISHU_CODEX_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))).expanduser()
         return cls(
             app_id=os.getenv("FEISHU_APP_ID", "").strip(),
             app_secret=os.getenv("FEISHU_APP_SECRET", "").strip(),
             workdir=Path(os.getenv("FEISHU_CODEX_WORKDIR", str(DEFAULT_WORKDIR))).expanduser(),
-            runtime_dir=Path(os.getenv("FEISHU_CODEX_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))).expanduser(),
+            runtime_dir=runtime_dir,
             codex_bin=os.getenv("CODEX_BIN", "codex").strip() or "codex",
             node_bin=os.getenv("NODE_BIN", "").strip(),
+            codex_backend=os.getenv("FEISHU_CODEX_BACKEND", DEFAULT_CODEX_BACKEND).strip().lower()
+            or DEFAULT_CODEX_BACKEND,
+            codex_model=os.getenv("FEISHU_CODEX_MODEL", "").strip(),
             bot_aliases=tuple(_csv_env("FEISHU_BOT_ALIASES") or ["Codex", "codex", "机器人"]),
             ignore_older_than_seconds=_int_env("FEISHU_IGNORE_OLD_MESSAGE_SECONDS", 600),
             reply_max_chars=_int_env("FEISHU_REPLY_MAX_CHARS", 3500),
@@ -182,6 +203,12 @@ class FeishuDocumentResult:
     title: str
     document_id: str
     url: str
+
+
+@dataclass(frozen=True)
+class FeishuGroupChatResult:
+    name: str
+    chat_id: str
 
 
 class StateStore:
@@ -595,6 +622,275 @@ class CodexRunner:
         return [self.config.codex_bin]
 
 
+class CodexAppServerRunner:
+    def __init__(self, config: BridgeConfig) -> None:
+        self.config = config
+        self._next_id = 0
+
+    def run(self, prompt: str, thread_id: str | None) -> tuple[str | None, str]:
+        command = [*CodexRunner(self.config)._codex_command(), "app-server"]
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(self.config.workdir),
+            bufsize=1,
+        )
+        stderr_lines: list[str] = []
+        stderr_thread = threading.Thread(target=self._drain_stderr, args=(process, stderr_lines), daemon=True)
+        stderr_thread.start()
+
+        agent_parts: list[str] = []
+        completed_agent_messages: list[str] = []
+        errors: list[str] = []
+        active_thread_id = thread_id
+        try:
+            init_id = self._send_request(
+                process,
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "feishu_codex_bridge",
+                        "title": "FeishuCodexBridge",
+                        "version": VERSION,
+                    },
+                    "capabilities": {"experimentalApi": True},
+                },
+            )
+            self._read_until_response(process, init_id, agent_parts, completed_agent_messages, errors)
+            self._send_notification(process, "initialized", {})
+
+            active_thread_id = self._start_or_resume_thread(
+                process,
+                active_thread_id,
+                agent_parts,
+                completed_agent_messages,
+                errors,
+            )
+            turn_params: dict[str, Any] = {
+                "threadId": active_thread_id,
+                "cwd": str(self.config.workdir),
+                "input": [{"type": "text", "text": prompt}],
+            }
+            if self.config.codex_model:
+                turn_params["model"] = self.config.codex_model
+            turn_id = self._send_request(process, "turn/start", turn_params)
+            self._read_until_response(process, turn_id, agent_parts, completed_agent_messages, errors)
+            self._read_until_turn_completed(process, active_thread_id, agent_parts, completed_agent_messages, errors)
+
+            reply = "".join(agent_parts).strip()
+            if not reply and completed_agent_messages:
+                reply = completed_agent_messages[-1].strip()
+            if not reply and errors:
+                reply = "Codex app-server 执行过程中出现错误：\n" + "\n".join(errors[-3:])
+            return active_thread_id, reply
+        finally:
+            self._stop_process(process)
+            stderr_thread.join(timeout=0.5)
+
+    def _start_or_resume_thread(
+        self,
+        process: subprocess.Popen,
+        thread_id: str | None,
+        agent_parts: list[str],
+        completed_agent_messages: list[str],
+        errors: list[str],
+    ) -> str:
+        params: dict[str, Any] = {
+            "cwd": str(self.config.workdir),
+            "threadSource": "user",
+        }
+        if self.config.codex_model:
+            params["model"] = self.config.codex_model
+        if thread_id:
+            resume_params = {key: value for key, value in params.items() if key != "threadSource"}
+            resume_params["threadId"] = thread_id
+            request_id = self._send_request(process, "thread/resume", resume_params)
+            response = self._read_until_response(
+                process,
+                request_id,
+                agent_parts,
+                completed_agent_messages,
+                errors,
+                raise_for_error=False,
+            )
+            if "error" not in response:
+                return self._thread_id_from_response(response) or thread_id
+            errors.append(f"thread/resume 失败，已改为新会话：{response['error'].get('message', '')}")
+
+        request_id = self._send_request(process, "thread/start", params)
+        response = self._read_until_response(process, request_id, agent_parts, completed_agent_messages, errors)
+        new_thread_id = self._thread_id_from_response(response)
+        if not new_thread_id:
+            raise RuntimeError(f"app-server thread/start 未返回 thread id：{json.dumps(response, ensure_ascii=False)[:500]}")
+        return new_thread_id
+
+    def _send_request(self, process: subprocess.Popen, method: str, params: dict[str, Any]) -> int:
+        request_id = self._next_id
+        self._next_id += 1
+        self._send(process, {"method": method, "id": request_id, "params": params})
+        return request_id
+
+    def _send_notification(self, process: subprocess.Popen, method: str, params: dict[str, Any]) -> None:
+        self._send(process, {"method": method, "params": params})
+
+    def _send(self, process: subprocess.Popen, message: dict[str, Any]) -> None:
+        if not process.stdin:
+            raise RuntimeError("codex app-server stdin 不可用。")
+        process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    def _read_until_response(
+        self,
+        process: subprocess.Popen,
+        request_id: int,
+        agent_parts: list[str],
+        completed_agent_messages: list[str],
+        errors: list[str],
+        *,
+        raise_for_error: bool = True,
+    ) -> dict[str, Any]:
+        while True:
+            message = self._read_message(process)
+            if message.get("id") == request_id:
+                if "error" in message and raise_for_error:
+                    error = message["error"]
+                    raise RuntimeError(str(error.get("message") or error))
+                return message
+            self._handle_server_message(process, message, agent_parts, completed_agent_messages, errors)
+
+    def _read_until_turn_completed(
+        self,
+        process: subprocess.Popen,
+        thread_id: str,
+        agent_parts: list[str],
+        completed_agent_messages: list[str],
+        errors: list[str],
+    ) -> None:
+        while True:
+            message = self._read_message(process)
+            method = str(message.get("method") or "")
+            params = message.get("params") if isinstance(message.get("params"), dict) else {}
+            self._handle_server_message(process, message, agent_parts, completed_agent_messages, errors)
+            if method == "turn/completed" and params.get("threadId") == thread_id:
+                turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+                status = str(turn.get("status") or "")
+                if status and status not in {"completed", "submitted"}:
+                    errors.append(f"turn/completed status={status}")
+                return
+
+    def _read_message(self, process: subprocess.Popen) -> dict[str, Any]:
+        if not process.stdout:
+            raise RuntimeError("codex app-server stdout 不可用。")
+        line = process.stdout.readline()
+        if not line:
+            code = process.poll()
+            raise RuntimeError(f"codex app-server 已退出，退出码 {code}。")
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"codex app-server 返回了非 JSON 行：{line[:300]}") from exc
+        if not isinstance(message, dict):
+            raise RuntimeError(f"codex app-server 返回了非对象消息：{message!r}")
+        return message
+
+    def _handle_server_message(
+        self,
+        process: subprocess.Popen,
+        message: dict[str, Any],
+        agent_parts: list[str],
+        completed_agent_messages: list[str],
+        errors: list[str],
+    ) -> None:
+        method = str(message.get("method") or "")
+        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if method == "item/agentMessage/delta":
+            agent_parts.append(str(params.get("delta") or ""))
+            return
+        if method == "item/completed":
+            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+            text = extract_app_server_agent_message_text(item)
+            if text:
+                completed_agent_messages.append(text)
+            return
+        if method == "error":
+            error = params.get("error") if isinstance(params.get("error"), dict) else params
+            errors.append(str(error))
+            return
+        if "id" in message and method:
+            self._reply_to_server_request(process, message)
+
+    def _reply_to_server_request(self, process: subprocess.Popen, message: dict[str, Any]) -> None:
+        method = str(message.get("method") or "")
+        request_id = message.get("id")
+        if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+            self._send(process, {"id": request_id, "result": {"decision": "decline"}})
+            return
+        if method == "item/permissions/requestApproval":
+            self._send(process, {"id": request_id, "result": {"decision": "decline"}})
+            return
+        if method == "item/tool/requestUserInput":
+            self._send(process, {"id": request_id, "result": {"answers": {}}})
+            return
+        if method == "mcpServer/elicitation/request":
+            self._send(process, {"id": request_id, "result": {"action": "decline", "content": None}})
+            return
+        self._send(process, {"id": request_id, "error": {"code": -32601, "message": f"Unsupported request: {method}"}})
+
+    def _thread_id_from_response(self, response: dict[str, Any]) -> str | None:
+        result = response.get("result") if isinstance(response.get("result"), dict) else {}
+        thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+        thread_id = thread.get("id")
+        return str(thread_id) if thread_id else None
+
+    def _drain_stderr(self, process: subprocess.Popen, stderr_lines: list[str]) -> None:
+        if not process.stderr:
+            return
+        for line in process.stderr:
+            if len(stderr_lines) < 20:
+                stderr_lines.append(line.rstrip())
+
+    def _stop_process(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def create_codex_runner(config: BridgeConfig) -> Any:
+    if config.codex_backend == "app-server":
+        return CodexAppServerRunner(config)
+    if config.codex_backend == "exec":
+        return CodexRunner(config)
+    raise ValueError("FEISHU_CODEX_BACKEND 只支持 exec 或 app-server。")
+
+
+def extract_app_server_agent_message_text(item: dict[str, Any]) -> str | None:
+    item_type = str(item.get("type") or "")
+    if item_type not in {"agentMessage", "agent_message", "message"}:
+        return None
+    text = item.get("text")
+    if isinstance(text, str):
+        return text
+    content = item.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        if parts:
+            return "".join(parts)
+    return None
+
+
 class FeishuOpenAPIClient:
     def __init__(self, config: BridgeConfig) -> None:
         self.config = config
@@ -672,6 +968,29 @@ class FeishuOpenAPIClient:
             page_token = str(data.get("page_token") or "")
             if not page_token:
                 return count
+
+    def create_group_chat(self, name: str, user_open_id: str) -> FeishuGroupChatResult:
+        body = {
+            "name": name,
+            "description": "FeishuCodexBridge 创建的测试群",
+            "owner_id": user_open_id,
+            "user_id_list": [user_open_id],
+            "bot_id_list": [self.config.app_id],
+            "chat_mode": "group",
+            "chat_type": "private",
+            "external": False,
+        }
+        data = self.request(
+            "POST",
+            "/im/v1/chats",
+            body,
+            {"user_id_type": "open_id"},
+        )
+        chat = data.get("chat") if isinstance(data.get("chat"), dict) else data
+        chat_id = str(chat.get("chat_id") or data.get("chat_id") or "")
+        if not chat_id:
+            raise RuntimeError(f"chat create returned no chat_id: {json.dumps(data, ensure_ascii=False)[:200]}")
+        return FeishuGroupChatResult(name=str(chat.get("name") or name), chat_id=chat_id)
 
     def _request_json(self, method: str, url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         method = method.upper()
@@ -816,6 +1135,7 @@ def build_prompt(envelope: MessageEnvelope, route: RouteDecision, config: Bridge
     capabilities = [MOBILE_REPLY_CONTEXT]
     if config is None or config.codex_cards_enabled:
         capabilities.append(CARD_REPLY_CONTEXT)
+        capabilities.append(READING_CONFIRMATION_CONTEXT)
     if config and config.docs_enabled:
         capabilities.append(DOC_REPLY_CONTEXT)
     bridge_context = {
@@ -855,6 +1175,7 @@ def build_card_action_prompt(
     capabilities = [MOBILE_REPLY_CONTEXT]
     if config is None or config.codex_cards_enabled:
         capabilities.append(CARD_REPLY_CONTEXT)
+        capabilities.append(READING_CONFIRMATION_CONTEXT)
     if config and config.docs_enabled:
         capabilities.append(DOC_REPLY_CONTEXT)
     return (
@@ -866,6 +1187,52 @@ def build_card_action_prompt(
         "[card-click] "
         + json.dumps(payload, ensure_ascii=False)
     )
+
+
+def parse_create_group_chat_name(text: str) -> str | None:
+    normalized = text.strip()
+    if not any(trigger in normalized for trigger in ("建群", "建一个", "建个", "创建群", "创建一个群", "创建一个", "创建个", "创建群聊", "新建群")):
+        return None
+
+    command_match = re.match(
+        r"^[/／]?(?:建群|创建群|创建群聊|新建群)\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if command_match:
+        name = clean_group_chat_name(command_match.group(1))
+        if name:
+            return name
+
+    patterns = [
+        r"(?:群名|群名称|群聊名|群聊名称|名字|名称)\s*(?:是|为|叫|叫做|命名成|命名为|设为|设置为)?\s*[：:=]?\s*([^，。,.\n]+)",
+        r"(?:命名成|命名为|叫做|叫)\s*([^，。,.\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            name = clean_group_chat_name(match.group(1))
+            if name:
+                return name
+
+    casual_match = re.match(
+        r"^[/／]?(?:帮我)?(?:建|创建|新建)(?:一个|个)?\s*(.+?)(?:群|群聊)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if casual_match:
+        name = clean_group_chat_name(casual_match.group(1))
+        if name:
+            return name
+    return None
+
+
+def clean_group_chat_name(value: str) -> str:
+    name = value.strip()
+    name = re.sub(r"^(?:成|为|叫|叫做)\s*", "", name)
+    name = name.strip(" \t\r\n\"'“”‘’《》「」[]【】")
+    name = re.sub(r"\s+", " ", name)
+    return name[:60].strip()
 
 
 def handle_command(store: StateStore, route: RouteDecision, text: str, config: BridgeConfig | None = None) -> str | None:
@@ -1504,7 +1871,7 @@ class FeishuCodexBridge:
     def __init__(self, config: BridgeConfig, api_client: Any, reply_request: Any, reply_body: Any) -> None:
         self.config = config
         self.store = StateStore(config.db_path)
-        self.runner = CodexRunner(config)
+        self.runner = create_codex_runner(config)
         self.api_client = api_client
         self.reply_request = reply_request
         self.reply_body = reply_body
@@ -1574,6 +1941,28 @@ class FeishuCodexBridge:
             self._group_member_count_cache[chat_id] = (now, count)
         return count
 
+    def _handle_native_command(self, envelope: MessageEnvelope) -> str | None:
+        group_name = parse_create_group_chat_name(envelope.text)
+        if group_name:
+            return self._create_group_chat_reply(envelope, group_name)
+        return None
+
+    def _create_group_chat_reply(self, envelope: MessageEnvelope, group_name: str) -> str:
+        if not envelope.sender_id:
+            return "建群失败：当前消息里没有发送人的 open_id，无法把你加入新群。"
+        try:
+            created = self.open_api.create_group_chat(group_name, envelope.sender_id)
+        except Exception as exc:
+            return (
+                f"建群失败：{exc}\n\n"
+                "请检查应用是否已申请并发布 `im:chat:create` 和 `im:chat` 权限。"
+            )
+        return (
+            f"已创建群聊：{created.name}\n"
+            f"chat_id：{created.chat_id}\n\n"
+            "成员：你 + 当前机器人。"
+        )
+
     def handle_message(self, data: Any) -> None:
         envelope = extract_envelope(data, self.config.bot_aliases)
         if not envelope.message_id:
@@ -1599,6 +1988,12 @@ class FeishuCodexBridge:
         self.store.record_user_message(route.session_key, envelope)
         if not self._reply_topic_notice(envelope.message_id, topic.notice):
             self._reply_ack(envelope.message_id)
+
+        native_reply = self._handle_native_command(envelope)
+        if native_reply is not None:
+            self._reply_text(envelope.message_id, native_reply)
+            self.store.record_reply(envelope.message_id, native_reply)
+            return
 
         command_reply = handle_command(self.store, route, envelope.text, self.config)
         if command_reply is not None:

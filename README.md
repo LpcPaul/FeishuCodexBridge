@@ -97,6 +97,7 @@ cd FeishuCodexBridge
 - `/clear` 或 `清空上下文`：清空当前飞书容器绑定的 Codex 对话。
 - `/status` 或 `当前会话`：查看当前飞书容器绑定的 Codex 会话。
 - `继续上个话题`：私聊主 Bot 切回上一个话题。
+- `建群 测试` 或“创建一个只有我和机器人的群，名字叫测试”：Bridge 调用飞书创建一个包含当前用户和机器人的私有群聊。
 
 ## 核心配置
 
@@ -115,6 +116,8 @@ FEISHU_CODEX_WORKDIR="$HOME"
 PYTHON_BIN=/path/to/python3
 NODE_BIN=/path/to/node
 CODEX_BIN=/path/to/codex
+FEISHU_CODEX_BACKEND=exec
+FEISHU_CODEX_MODEL=
 FEISHU_TOPIC_IDLE_SECONDS=7200
 FEISHU_TOPIC_NOTICE_POLL_SECONDS=60
 FEISHU_TASK_PROGRESS_SECONDS=7200
@@ -130,13 +133,33 @@ FEISHU_DOCS_FOLDER_TOKEN=
 FEISHU_DOCS_AUTO_MIN_CHARS=4500
 ```
 
+`FEISHU_CODEX_BACKEND` 可选：
+
+- `exec`：默认值，沿用 `codex exec` / `codex exec resume`。
+- `app-server`：使用 `codex app-server` JSON-RPC 协议创建/继续线程并收集流式结果。当前版本先接通线程与回复；审批请求会被拒绝并让 Codex 继续处理，后续再接飞书按钮审批。
+
 ## 卡片与文档能力
 
 卡片能力默认开启，且默认使用 CardKit 2.0。Codex 如果需要发交互卡片，会在最终回复中输出 `feishu-card` JSON 块；Bridge 会把 JSON 2.0 卡片创建成卡片实体，再按 `card_id` 发送，并把按钮点击或表单提交转回同一个 Codex 会话。
 
+飞书阅读确认不由 Bridge 做固定语句识别。用户通过飞书用“帮我读一下”“帮我理解一下”“总结一下这几篇文章”等非标准表达发来一篇或多篇文章时，由 Codex 自己判断是否生成阅读确认卡片。Bridge 只负责把 Codex 输出的卡片发出去，并把卡片反馈续回同一个 Codex 会话。
+
+阅读确认卡片的确认项数量不设固定条数。Codex 应根据文章长度、信息密度和可讨论价值决定拆解粒度：短文可以少，长文可以多，但每条都要有明确增量价值，并提供 `知道了`、`不感兴趣`、`展开讲讲` 或文本反馈入口。
+
 需要多选、表单和提交反馈时，Codex 应使用 JSON 2.0 的 `form` 容器和 `multi_select_static` 组件。Bridge 会把旧式 `checkbox_group` 测试卡片自动转换成 CardKit 2.0 表单，避免飞书接口返回 `unsupported type of block`。
 
 卡片提交后，Bridge 会立即向飞书返回卡片回调响应，并在后台给聊天发一条可见回执。默认模式会继续把提交内容交给 Codex 处理，并在完成后返回结果；如果某张卡片只需要确认收到，回调 `value` 可以设置 `requires_codex:false` 或 `feedback_mode:"ack"`，Bridge 就只发默认回执，不启动 Codex。
+
+## 建群能力
+
+Bridge 支持明确的建群命令，例如：
+
+```text
+建群 测试
+创建一个只有我和当前机器人的群，名字叫测试
+```
+
+Bridge 会用当前消息发送人的 `open_id` 加上当前应用机器人创建一个私有群聊，并返回新群 `chat_id`。该能力需要应用已申请并发布 `im:chat:create`，建议同时保留 `im:chat` 方便后续群管理。
 
 飞书文档能力默认关闭。开启前需要先在飞书开放平台给应用申请新版文档创建/编辑权限，然后配置：
 
@@ -160,6 +183,6 @@ FEISHU_DOCS_FOLDER_TOKEN=可选的目标文件夹 token
 
 ## 版本
 
-当前版本：`0.4.1`
+当前版本：`0.5.0`
 
 版本记录见 [CHANGELOG.md](CHANGELOG.md)。

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 - 2026-06-02
+
+- Added optional `FEISHU_CODEX_BACKEND=app-server` support using `codex app-server` JSON-RPC.
+- Kept `FEISHU_CODEX_BACKEND=exec` as the default compatible backend.
+- Added optional `FEISHU_CODEX_MODEL` override.
+- Documented the current app-server boundary: thread/turn and streamed replies are supported, while approval requests are declined until Feishu button approval is implemented.
+
 ## 0.4.1 - 2026-05-30
 
 - Made Codex card callbacks return immediately while acknowledgement and Codex processing continue in the background.

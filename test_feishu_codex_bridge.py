@@ -8,23 +8,71 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from feishu_codex_bridge import (
+    CodexAppServerRunner,
     BridgeConfig,
     CodexRunner,
     FeishuDocumentResult,
     FeishuDocRequest,
     FeishuCodexBridge,
+    FeishuOpenAPIClient,
     MessageEnvelope,
     MOBILE_REPLY_CONTEXT,
+    READING_CONFIRMATION_CONTEXT,
     StateStore,
     build_prompt,
+    create_codex_runner,
+    extract_app_server_agent_message_text,
     extract_message_text,
     extract_feishu_cards,
+    parse_create_group_chat_name,
     parse_last_agent_message,
     parse_thread_id,
     prepare_feishu_card_for_delivery,
     route_message,
     stamp_codex_card_callbacks,
 )
+
+
+class FakeAppServerProcess:
+    def __init__(self, lines):
+        self.stdin = self.FakeStdin(self)
+        self.stdout = self.FakeStdout(lines)
+        self.stderr = []
+        self.sent = []
+        self.terminated = False
+        self.killed = False
+
+    class FakeStdin:
+        def __init__(self, process):
+            self.process = process
+
+        def write(self, value):
+            self.process.sent.append(json.loads(value))
+
+        def flush(self):
+            return None
+
+    class FakeStdout:
+        def __init__(self, lines):
+            self.lines = list(lines)
+
+        def readline(self):
+            if not self.lines:
+                return ""
+            return json.dumps(self.lines.pop(0), ensure_ascii=False) + "\n"
+
+    def poll(self):
+        return 0 if self.terminated or self.killed else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.terminated = True
+        return 0
 
 
 class FeishuCodexBridgeTests(unittest.TestCase):
@@ -80,12 +128,46 @@ class FeishuCodexBridgeTests(unittest.TestCase):
         self.assertEqual(parse_thread_id(stdout), "abc")
         self.assertEqual(parse_last_agent_message(stdout), "OK")
 
+    def test_parse_create_group_chat_name(self):
+        self.assertEqual(parse_create_group_chat_name("建群 测试"), "测试")
+        self.assertEqual(parse_create_group_chat_name("建一个测试群"), "测试")
+        self.assertEqual(parse_create_group_chat_name("帮我建个 Codex 测试群"), "Codex 测试")
+        self.assertEqual(
+            parse_create_group_chat_name("创建一个群消息，就是只有我和当前聊天机器人的一个群。这个群的名字命名成测试"),
+            "测试",
+        )
+        self.assertIsNone(parse_create_group_chat_name("普通聊天"))
+
+    def test_open_api_create_group_chat_uses_current_user_and_bot(self):
+        class FakeOpenAPI(FeishuOpenAPIClient):
+            def __init__(self):
+                super().__init__(BridgeConfig("cli_bot", "secret"))
+                self.calls = []
+
+            def request(self, method, path, body=None, query=None):
+                self.calls.append((method, path, body, query))
+                return {"chat": {"chat_id": "oc_test", "name": body["name"]}}
+
+        api = FakeOpenAPI()
+        result = api.create_group_chat("测试", "ou_user")
+
+        self.assertEqual(result.chat_id, "oc_test")
+        self.assertEqual(result.name, "测试")
+        method, path, body, query = api.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/im/v1/chats")
+        self.assertEqual(query, {"user_id_type": "open_id"})
+        self.assertEqual(body["owner_id"], "ou_user")
+        self.assertEqual(body["user_id_list"], ["ou_user"])
+        self.assertEqual(body["bot_id_list"], ["cli_bot"])
+
     def test_build_prompt_includes_mobile_reply_context(self):
         envelope = MessageEnvelope("m1", "c1", "p2p", "text", "帮我总结一下", "", "", "", None, True)
         route = route_message(envelope)
         prompt = build_prompt(envelope, route)
 
         self.assertIn(MOBILE_REPLY_CONTEXT, prompt)
+        self.assertIn(READING_CONFIRMATION_CONTEXT, prompt)
         self.assertIn("用户消息：\n帮我总结一下", prompt)
 
     def test_direct_chat_message_keeps_active_topic_after_idle_timeout(self):
@@ -212,6 +294,101 @@ class FeishuCodexBridgeTests(unittest.TestCase):
         self.assertEqual(thread_id, "thread-no-timeout")
         self.assertEqual(reply, "最终回复")
 
+    def test_create_codex_runner_selects_backend(self):
+        exec_config = BridgeConfig("app", "secret", codex_backend="exec")
+        app_server_config = BridgeConfig("app", "secret", codex_backend="app-server")
+
+        self.assertIsInstance(create_codex_runner(exec_config), CodexRunner)
+        self.assertIsInstance(create_codex_runner(app_server_config), CodexAppServerRunner)
+
+    def test_extract_app_server_agent_message_text(self):
+        self.assertEqual(
+            extract_app_server_agent_message_text({"type": "agentMessage", "text": "OK"}),
+            "OK",
+        )
+        self.assertEqual(
+            extract_app_server_agent_message_text(
+                {"type": "agentMessage", "content": [{"type": "output_text", "text": "O"}, {"text": "K"}]}
+            ),
+            "OK",
+        )
+        self.assertIsNone(extract_app_server_agent_message_text({"type": "commandExecution", "text": "ignored"}))
+
+    def test_codex_app_server_runner_starts_thread_and_turn(self):
+        process = FakeAppServerProcess(
+            [
+                {"id": 0, "result": {"userAgent": "codex-test"}},
+                {"id": 1, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 2, "result": {"turn": {"id": "turn-1"}}},
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "thr-new", "turnId": "turn-1", "itemId": "item-1", "delta": "最终"},
+                },
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"threadId": "thr-new", "turnId": "turn-1", "itemId": "item-1", "delta": "回复"},
+                },
+                {"method": "turn/completed", "params": {"threadId": "thr-new", "turn": {"id": "turn-1", "status": "completed"}}},
+            ]
+        )
+
+        def fake_popen(command, **kwargs):
+            self.assertEqual(command, ["/usr/local/bin/codex", "app-server"])
+            self.assertEqual(kwargs["cwd"], "/tmp")
+            return process
+
+        config = BridgeConfig(
+            "app",
+            "secret",
+            workdir=Path("/tmp"),
+            codex_bin="/usr/local/bin/codex",
+            codex_backend="app-server",
+            codex_model="gpt-test",
+        )
+        with patch("feishu_codex_bridge.subprocess.Popen", fake_popen):
+            thread_id, reply = CodexAppServerRunner(config).run("跑一个任务", None)
+
+        self.assertEqual(thread_id, "thr-new")
+        self.assertEqual(reply, "最终回复")
+        self.assertEqual(process.sent[0]["method"], "initialize")
+        self.assertEqual(process.sent[1], {"method": "initialized", "params": {}})
+        self.assertEqual(process.sent[2]["method"], "thread/start")
+        self.assertEqual(process.sent[2]["params"]["model"], "gpt-test")
+        self.assertEqual(process.sent[3]["method"], "turn/start")
+        self.assertEqual(process.sent[3]["params"]["threadId"], "thr-new")
+        self.assertEqual(process.sent[3]["params"]["input"][0]["text"], "跑一个任务")
+
+    def test_codex_app_server_runner_falls_back_when_resume_fails(self):
+        process = FakeAppServerProcess(
+            [
+                {"id": 0, "result": {"userAgent": "codex-test"}},
+                {"id": 1, "error": {"code": -32000, "message": "missing thread"}},
+                {"id": 2, "result": {"thread": {"id": "thr-new"}}},
+                {"id": 3, "result": {"turn": {"id": "turn-1"}}},
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thr-new",
+                        "turnId": "turn-1",
+                        "item": {"type": "agentMessage", "text": "完成"},
+                    },
+                },
+                {"method": "turn/completed", "params": {"threadId": "thr-new", "turn": {"id": "turn-1", "status": "completed"}}},
+            ]
+        )
+
+        with patch("feishu_codex_bridge.subprocess.Popen", return_value=process):
+            thread_id, reply = CodexAppServerRunner(BridgeConfig("app", "secret", workdir=Path("/tmp"))).run(
+                "继续任务",
+                "thr-old",
+            )
+
+        self.assertEqual(thread_id, "thr-new")
+        self.assertEqual(reply, "完成")
+        self.assertEqual(process.sent[2]["method"], "thread/resume")
+        self.assertEqual(process.sent[2]["params"]["threadId"], "thr-old")
+        self.assertEqual(process.sent[3]["method"], "thread/start")
+
     def test_handle_message_replies_ack_before_running_codex(self):
         events = []
         runner_started = threading.Event()
@@ -263,6 +440,61 @@ class FeishuCodexBridgeTests(unittest.TestCase):
             time.sleep(0.05)
 
         self.assertEqual(events, [("reply", "收到，我要开始干活了，稍等我"), ("run", None), ("reply", "最终回复")])
+
+    def test_handle_message_creates_group_chat_without_running_codex(self):
+        events = []
+
+        class FakeOpenAPI:
+            def create_group_chat(self, name, user_open_id):
+                events.append(("create_group", name, user_open_id))
+                return SimpleNamespace(name=name, chat_id="oc_test")
+
+        class FakeRunner:
+            def run(self, prompt, thread_id):
+                events.append(("run", thread_id))
+                return "thread", "不应执行"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = BridgeConfig("cli_bot", "secret", runtime_dir=Path(tmp), task_progress_seconds=0)
+            bridge = FeishuCodexBridge(config, None, None, None)
+            bridge.open_api = FakeOpenAPI()
+            bridge.runner = FakeRunner()
+
+            def fake_reply(message_id, text):
+                events.append(("reply", message_id, text))
+
+            bridge._reply_text = fake_reply
+            data = SimpleNamespace(
+                event=SimpleNamespace(
+                    sender=SimpleNamespace(
+                        sender_id=SimpleNamespace(open_id="ou_user", user_id="", union_id=""),
+                        sender_name="User",
+                    ),
+                    message=SimpleNamespace(
+                        message_id="m-create-group",
+                        chat_id="c1",
+                        chat_type="p2p",
+                        message_type="text",
+                        content=json.dumps(
+                            {"text": "创建一个群消息，就是只有我和当前聊天机器人的一个群。这个群的名字命名成测试"},
+                            ensure_ascii=False,
+                        ),
+                        root_id="",
+                        parent_id="",
+                        thread_id="",
+                        create_time="",
+                        mentions=None,
+                    ),
+                )
+            )
+
+            bridge.handle_message(data)
+
+        self.assertIn(("create_group", "测试", "ou_user"), events)
+        self.assertIn(("reply", "m-create-group", "收到，我要开始干活了，稍等我"), events)
+        reply = next(event[2] for event in events if event[0] == "reply" and "oc_test" in event[2])
+        self.assertIn("已创建群聊：测试", reply)
+        self.assertFalse(any(event[0] == "run" for event in events))
 
     def test_handle_message_auto_replies_in_small_group(self):
         events = []
